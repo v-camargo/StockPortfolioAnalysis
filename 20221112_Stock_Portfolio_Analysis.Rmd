@@ -1,0 +1,897 @@
+---
+title: "Assets Portfolio Analysis"
+date: "11/12/2022"
+output: html_document
+---
+
+
+## Summary
+
+This document studies the time series of a group of 6 assets with the aim of suggesting an investment portfolio composed of a mixture of specific proportions of this assets. These proportions, will be calculated through the analysis of the log-return series of the assets, as well as modeling its volatility and calculating the Sharpe ratio index. Finally, the study will end calculating the return of the portfolio, as well as its volatility, and compare it to a benchmark, which in this case will be the **IBOVESPA** index. 
+For the purpose fo this work, it will analyzed the following assets:
+
+
+  **Company Stocks**\
+  
+  - Magazine Luiza S.A. (MGLU3.SA);\
+  
+  - Vale S.A. (VALE3.SA);\
+  
+  - Petróleo Brasileiro S.A. - Petrobras (PETR4.SA);\ 
+  
+  - B3 S.A. - Brasil, Bolsa, Balcão (B3SA3.SA);\
+  
+  - Eneva S.A. (ENEV3.SA);\
+  
+  
+  **Real Estate Investment Fund**\
+  
+  - CSHG Real Estate - Fundo de Investimento Imobiliario - FII (HGRE11.SA);
+
+
+```{r configs, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, include = TRUE, message = FALSE)
+```
+
+## Loading libraries
+
+```{r libraries}
+
+library(dplyr)
+library(tidyverse)
+library(ggthemes)
+library(fpp3)
+library(forecast)
+library(gridExtra)
+library(ggpubr)
+library(tseries)
+library(prophet)
+library(rugarch)
+library(yfR)
+library(timetk)
+library(tidyquant)
+```
+
+
+## Functions definition
+
+```{r model_builder}
+
+##-- Defining function: Create a GARCH MODEL --##
+
+## Creating a function that adjust a Garch model for a given set of parameters / data
+GModels <- function(parms, series, prog = NULL) {
+  
+  if (!is.null(prog)) prog()
+  
+  if(parms$model=="iGARCH"){
+    
+    ## Configuring iGARCH model
+    garch_model = ugarchspec(
+    variance.model = list(model=parms$model, garchOrder=c(parms$m, parms$n)),
+    mean.model = list(armaOrder = c(parms$p, parms$q), include.mean = TRUE),
+    distribution.model = parms$dist)
+  }
+  
+  else {
+    
+    ## Configuring other models
+    garch_model = ugarchspec(
+    variance.model = list(model=parms$model, submodel=parms$submodel, garchOrder=c(parms$m, parms$n)),
+    mean.model = list(armaOrder = c(parms$p, parms$q), include.mean = TRUE),
+    distribution.model = parms$dist
+    )
+  }
+  
+  
+  ## Suppressing warning when the model doesnt converge
+  suppressWarnings({fit <- ugarchfit(spec=garch_model, data=series, solver='solnp', solver.control=list(tol = 5e-8))})
+  
+  ## Return the fit model
+  fit
+}
+
+
+
+##-- Defining function: Find Best GARCH --##
+
+## Creating a function that finds the best Garch model for each asset
+find_best_garch <- function(asset, grid, df) {
+     
+  ## Selects the asset and it squared log return
+  ret2 <- df_log_returns %>% filter(ticker==asset) %>% select(ret_closing_prices) %>% pull()
+  
+  ## Print which asset is being adjusted
+  usethis::ui_info("Adjusting models for {asset}...")
+ 
+  ## Show progress
+  progressr::with_progress({
+    prog <- progressr::progressor(nrow(grid))
+    models <- grid %>%
+      group_split(id) %>%
+      purrr::map(GModels, series=ret2, prog)
+    })
+  
+  safe_info <- purrr::possibly(infocriteria, tibble::tibble())
+  
+  ## Get model information
+  suppressWarnings({
+   info <- purrr::map(models, safe_info) %>%
+     purrr::map(tibble::as_tibble, rownames = "criteria") %>%
+     dplyr::bind_rows(.id = "id")
+   })
+  
+  return(info)
+  
+  ## Collecting models info
+  best <- info %>%
+    dplyr::inner_join(grid, "id") %>%
+    tidyr::pivot_wider(names_from = criteria, values_from = V1) %>%
+    janitor::clean_names() %>%
+    dplyr::arrange(akaike)
+  
+  ## Selecting the best parameters
+  usethis::ui_info(c(
+    "Best model:",
+    "p <- {best$p[1]}",
+    "q <- {best$q[1]}",
+    "m <- {best$m[1]}",
+    "n <- {best$n[1]}"
+    ))
+  
+  best
+}
+
+
+
+##-- Defining function: Volatility Backtest --##
+
+volatility_backtest <- function(parms) {
+  
+  ## Selects the asset and it squared log return
+  ret <- df_log_returns %>% filter(ticker==parms$ticker) %>% pull(ret_closing_prices)
+  
+  if(parms$model=="iGARCH"){
+    
+    ## Configuring iGARCH model
+    garch_model = ugarchspec(
+    variance.model = list(model=parms$model, garchOrder=c(parms$m, parms$n)),
+    mean.model = list(armaOrder = c(parms$p, parms$q), include.mean = T),
+    distribution.model = parms$dist)
+  }
+  
+  else {
+    
+    ## Configuring other models
+    garch_model = ugarchspec(
+    variance.model = list(model=parms$model, submodel=parms$submodel, garchOrder=c(parms$m, parms$n)),
+    mean.model = list(armaOrder = c(parms$p, parms$q), include.mean = T),
+    distribution.model = parms$dist
+    )
+  }
+  
+  
+  ## Performing backtest
+  suppressWarnings({garchroll <- ugarchroll(garch_model, data=ret, n.start = 200,
+                                            refit.window = c("recursive", "moving"),
+                                            refit.every = 50)})
+  
+  
+  ## Collecting the distribution coefficient
+  predictions <- as.data.frame(garchroll)
+  
+  # Prediction error for the mean
+  error  <- predictions$Realized - predictions$Mu 
+  
+  # Prediction error for the variance
+  volatility_error  <- error^2 - predictions$Sigma^2 
+  
+  # Mean of prediction error
+  return(mean(volatility_error^2))
+  
+}
+
+
+
+
+##-- Defining function: Volatility Forecast --##
+
+volatility_forecast <- function(parms, n_steps = 5) {
+  
+  ## Selects the asset and it squared log return
+  ret <- df_log_returns %>% filter(ticker==parms$ticker) %>% pull(ret_closing_prices)
+  
+  if(parms$model=="iGARCH"){
+    
+    ## Configuring iGARCH model
+    garch_model = ugarchspec(
+    variance.model = list(model=parms$model, garchOrder=c(parms$m, parms$n)),
+    mean.model = list(armaOrder = c(parms$p, parms$q), include.mean = T),
+    distribution.model = parms$dist)
+  }
+  
+  else {
+    
+    ## Configuring other models
+    garch_model = ugarchspec(
+    variance.model = list(model=parms$model, submodel=parms$submodel, garchOrder=c(parms$m, parms$n)),
+    mean.model = list(armaOrder = c(parms$p, parms$q), include.mean = T),
+    distribution.model = parms$dist
+    )
+  }
+  
+  
+  ## Suppressing warning when the model doesn't converge
+  suppressWarnings({fit <- ugarchfit(spec=garch_model, 
+                                     data=ret, 
+                                     solver='solnp', 
+                                     solver.control=list(tol=5e-8))})
+  
+  
+  ## Collecting the distribution coefficient
+  if (parms$dist == "std") {
+    shape <- as.numeric(fit@fit$coef["shape"])
+  } 
+  
+  else {
+    shape <- NA_real_
+  }
+
+  
+  ## Forecasting the next n_steps
+  suppressWarnings({forecasts <- ugarchforecast(fit, n.ahead=n_steps)@forecast})
+  
+  ## Returning results
+  return(list(
+    ticker=parms$ticker, 
+    serie=as.numeric(forecasts$seriesFor), 
+    volatility=as.numeric(forecasts$sigmaFor),
+    shape=shape,
+    mat_coef=fit@fit$matcoef
+    )
+  )
+  
+}
+
+
+
+##-- Defining function: Portfolio Simulation --##
+
+portfolio_simulation <- function(nruns, assets, return_xts) {
+  
+  ## Creating an empty dataset
+  portfolios <- tibble(
+                   id = as.numeric(),
+                   B3SA3.SA = as.numeric(),
+                   ENEV3.SA = as.numeric(),
+                   HGRE11.SA = as.numeric(),
+                   MGLU3.SA = as.numeric(),
+                   PETR4.SA = as.numeric(),
+                   VALE3.SA = as.numeric(),
+                   portfolio_return = as.numeric(),
+                   portfolio_volatility = as.numeric(),
+                   portfolio_sharpe_ratio = as.numeric()
+                  )
+  
+  ## Creating a progress bar
+  # pb <- txtProgressBar(min = 1, max = nruns, style = 3)
+  
+  ## Calculating mean return
+  mean_ret <- colMeans(return_xts, na.rm = TRUE)
+  
+  ## Calculating the covariance matrix
+  cov_mat <- cov(return_xts) * 252
+  
+  ## Iterating nruns times
+  for (i in 1:nruns){
+
+    ## Defining random weights and normalizing it so the sum adds up to 1
+    wts <- runif(length(assets))
+    wts <- wts/sum(wts)
+  
+    ## Calculating portfolio returns  
+    port_ret <- sum(wts * mean_ret)
+    
+    ## Multiplying by the number of working days
+    port_ret <- ((port_ret + 1)^252) - 1
+    
+    ## Calculate the portfolio risk (volatility / standard deviation)
+    port_sd <- as.numeric(sqrt(t(wts) %*% (cov_mat %*% wts)))
+    
+    ## Calculating Sharpe Ratio
+    sharpe_ratio <- port_ret / port_sd
+    
+    portfolios <- portfolios %>%
+      bind_rows(.,
+                tibble(
+                  id = i,
+                  B3SA3.SA = wts[names(mean_ret)=="B3SA3.SA"],
+                  ENEV3.SA = wts[names(mean_ret)=="ENEV3.SA"],
+                  HGRE11.SA = wts[names(mean_ret)=="HGRE11.SA"],
+                  MGLU3.SA = wts[names(mean_ret)=="MGLU3.SA"],
+                  PETR4.SA = wts[names(mean_ret)=="PETR4.SA"],
+                  VALE3.SA = wts[names(mean_ret)=="VALE3.SA"],
+                  portfolio_return = port_ret,
+                  portfolio_volatility = port_sd,
+                  portfolio_sharpe_ratio = sharpe_ratio
+                )
+               )
+    
+    # Print progress
+	  # setTxtProgressBar(pb, i)
+  }
+  
+  return(portfolios)
+}
+
+
+##-- Defining function: Calculate Beta --##
+
+calculate_beta <- function(asset) {
+  
+  ## Filtering the corresponding return series
+  series <- df_log_returns %>%
+    dplyr::filter(ticker==asset) %>%
+    dplyr::mutate(ibov_return = df_bvsp$ibov)
+  
+  ## Calculating beta
+  beta <- as.numeric(lm(ret_closing_prices ~ 0 + ibov_return, data = series)$coefficients[1])
+
+  return (beta)
+}
+```
+
+
+
+## Plotting stock price series
+
+The following plot shows the closing price for each of the assets mentioned in the summary of this document. The time series initial date was set to 2019-11-01 (Friday) and the final date the 2022-10-31 (Monday), configuring a time period of three years with price information in daily basis. Furthermore, by starting at the end of the year 2019, the prices fluctuation will capture the stock market crash due to the world health crisis announcement (COVID pandemics) on march 2020 and also the impact of the pandemic on the economy in subsequent months.
+
+During the pandemics, the fact that people were secluded at home caused the demand for delivery to increase significantly, mostly because delivery would be the most convenient option during lock-down but also because buying material goods would be a way of getting rid of boredom of being locked-down. In that context, eCommerce like **MGLU3.SA**, saw their sales volume boom resulting an increase of their stock prices in subsequently months. However, this movement also resulted an inflationary pressure in the price of goods which, along with the fact that many people were laid off during the pandemics, caused a decrease in the demand of delivery as the number of COVID cases saw a deceleration in the end of 2021. Consequently causing the stock prices of eCommerce companies to lose value.
+
+For **VALE3.SA**, the initial high value of the stock is a reflection of the attempt to restart the economy with the slowdown of the pandemic. This moment lasted until the third quarter of 2021, when a drop in the price of iron ore on the global market caused a decrease in value of the stock. On the other hand, the value of the asset rose again at the beginning of 2022 due to the lack of competition on the global market since the war in Ukraine started, along with the expectation of an upturn in the Chinese economy. However, it soon fell again when the Chinese government reestablished restrictions to contain further advances of COVID.
+
+On the other hand, **PETR4.SA** saw its stock value increase since the end of 2020 due to constant readjustments of local oil prices to international prices, motivated by the rise of the dollar, and to the increase in oil prices, in a more general way, due to the war between Russia and Ukraine since the beginning of 2022. More recently, the loss in value of the stock price was driven by risk aversion towards the future of the company with the election of Lula (even before the actual result). The financial market sees the election of Lula as a negative sign for the company since it would result in more interference, by the state, in company's business.
+
+**B3SA3.SA** was also impacted by the effects of the pandemic. The unprecedented drop in the value of company shares in general, added to the low return on fixed-income investments, opened an opportunity for many people to start investing in variable income with the aim of obtaining significant financial gains. With more people investing in variable income, B3 saw its revenue increase. However, with the gradual realization of profit by investors, added to the rise in the basic interest rate in order to contain the inflationary pressures caused by the pandemic, many investors migrated from variable income to fixed income, gradually reducing the company's ability to generate profit. In the beginning of 2022, in turn, reports showed that the company was favored by a large inflow of foreign money, however, in the beginning of April 2022, the company released an inform announcing a correction in the measurement of foreign money inflow which, in fact, indicated a decrease in external investments. This news caused a decrease on the asset value at the time, which has been recently recovered with positive performance.
+
+For **ENEV3.SA** the value of the stock decreased with the increase of the interest rate in Brazil since it slowed down several projects that the company had in its horizon reaching the lowest value in the beginning of 2022. Since then, the sequence of positive performance along with the promise of being able to end the payment of its accumulated debt in 2023 (damage caused by the scandal involving Eike Batista) has led the stock price to increase. However, the recent resignation of the company's CEO, Pedro Zinner, who has been instrumental in the company's financial restructuring, caused the asset price to fall again.
+
+Finally, **HGRE11.SA**, a real estate fund whose investments are mainly earmarked for properties in the corporate slab segment, saw the vacancy level of the fund's properties increase significantly during the pandemic, causing a negative impact on the value of the asset. However, the resumption of face-to-face work by companies has caused the vacancy value of properties to decrease recently. Mainly for properties located on important avenues such as Faria Lima.
+
+
+```{r reading_stocks, out.width="100%"}
+
+## Defining the start date of the time series
+start_date <- '2019-11-01'
+
+## Defining the end date of the time series
+end_date <- '2022-10-31'
+
+## Defining the stocks that will be considered for this analysis
+tickers <- c("HGRE11.SA", "MGLU3.SA", "VALE3.SA", "PETR4.SA", "B3SA3.SA", "ENEV3.SA")
+
+## Reading the log-return of each chosen stock
+#df_log_returns <- yfR::yf_get(
+#  tickers=tickers,
+#  first_date = start_date,
+#  type_return = "log",
+#  freq_data = "daily", 
+#  do_complete_data = TRUE
+#)
+
+
+## Reading the log-return of the assets closing price from a csv file
+df_log_returns <- read_csv("20221116_stocks.csv") %>%
+    mutate(ret_closing_prices = as.numeric(ret_closing_prices)) %>%
+    filter(ref_date >= start_date & ref_date <= end_date)
+
+## Converting the dataframe into a time series object using tsibble
+df_log_returns_tsibble <- df_log_returns %>% 
+  as_tsibble(key = ticker, index = ref_date, regular = FALSE)
+
+## Plotting the closing price time series
+df_log_returns_tsibble %>%
+  autoplot(price_close, colour = "black") +
+  facet_wrap(~ticker, scales = "free_y", ncol = 1) +
+  ggtitle("Closing price for selected assets", 
+          "Data ranging from Nov-2019 to Nov-22") +
+  labs(x="Reference Date", y = "Closing Price (R$)")
+```
+
+
+## Plotting the log return series of the stock price
+
+Looking at the graph of the log return on the closing price of the assets, it is noted that the visual aspect of the return series of **MGLU3.SA** is the one that suggests the highest volatility, especially in the last 12 months. On the other hand, the visual aspect of the real estate investment fund log return suggests that the asset has the lowest volatility among those studied. That statement will be verified later on this document, however it gives an educated guess about what to expect when calculating the volatility of the stock prices. 
+
+```{r plotting_close_price_return, out.width="100%"}
+## Plotting the closing price log return time series
+df_log_returns_tsibble %>%
+  autoplot(ret_closing_prices, colour = "black") +
+  facet_wrap(~ticker, scales = "fixed", ncol = 1) +
+  ggtitle("Log return of closing prices of selected assets", 
+          "Data ranging from Nov-2019 to Nov-22") +
+  labs(x="Reference Date", y = "Log Return of Closing Price")
+```
+
+```{r filtering_domain}
+## Calculating the first not null day: when calculating log returns the first day becomes null
+first_date <- df_log_returns_tsibble %>%
+  dplyr::group_by(ticker) %>% 
+  dplyr::filter(ref_date == min(ref_date)) %>% 
+  dplyr::ungroup() %>% 
+  with(max(ref_date))
+
+## Filtering out all data before "first_date"
+df_log_returns_cln_tsibble <- df_log_returns_tsibble %>%
+    dplyr::filter(ref_date > first_date)
+```
+
+
+## Plotting the ACF and PACF functions of the log-returns
+
+
+The plot of the **ACF** and **PACF** functions suggests the presence of some autocorrelation for all log-return series, especially for "ENEV3.SA", "HGRE11.SA" and "PETR4.SA". That means that the log-return of the chosen stocks can not be considered **stationary** and, therefore, it should be fit an ARMA model to make the series stationary. This will be done in following sections along with volatility modeling. 
+
+```{r plotting_acf, out.width="100%"}
+df_log_returns_cln_tsibble %>%
+  ACF(ret_closing_prices) %>%
+  autoplot() +
+  ggtitle("ACF plot of the log return of closing prices of selected assets") +
+  labs(x="Lag", y = "ACF")
+```
+
+
+
+```{r plotting_pacf, out.width="100%"}
+df_log_returns_cln_tsibble %>%
+  PACF(ret_closing_prices) %>%
+  autoplot() +
+  ggtitle("PACF plot of the log return of closing prices of selected assets") +
+  labs(x="Lag", y = "PACF")
+```
+In order to confirm that the log return series is not a white noise (as it would be expected in most cases) the following code snippet applies a Ljun-Box test on the log return series. If the Ljung-Box test returns a large p-value the null hypothesis is not rejected, suggesting that the series is a **white noise**. Ljung-Box hypothesis:\
+
+- H0: The series **behave like white noise**;
+- H1: The series **do not behave like white noise**;
+
+Looking at the p-values obtained with the test (for each individual series) it can be seen that they are all less than 0.05 for all series, therefore rejecting the null hypothesis and consequently concluding that they are not white noise. That, in turn, suggests that the series have auto-correlation as previously observed.
+
+```{r ljung_box_ret, out.width="100%"}
+## Pulling log return data for each log return series
+B3SA3ret <- df_log_returns %>% filter(ticker == 'B3SA3.SA') %>% select(ret_closing_prices) %>% pull()
+ENEV3ret <- df_log_returns %>% filter(ticker == 'ENEV3.SA') %>% select(ret_closing_prices) %>% pull()
+HGRE11ret <- df_log_returns %>% filter(ticker == 'HGRE11.SA') %>% select(ret_closing_prices) %>% pull()
+MGLU3ret <- df_log_returns %>% filter(ticker == 'MGLU3.SA') %>% select(ret_closing_prices) %>% pull()
+PETR4ret <- df_log_returns %>% filter(ticker == 'PETR4.SA') %>% select(ret_closing_prices) %>% pull()
+VALE3ret <- df_log_returns %>% filter(ticker == 'VALE3.SA') %>% select(ret_closing_prices) %>% pull()
+
+## Printing test results
+print(x=Box.test(B3SA3ret, lag=12, fitdf=1, type="Ljung-Box"))
+print(x=Box.test(ENEV3ret, lag=12, fitdf=1, type="Ljung-Box"))
+print(x=Box.test(HGRE11ret, lag=12, fitdf=1, type="Ljung-Box"))
+print(x=Box.test(MGLU3ret, lag=12, fitdf=1, type="Ljung-Box"))
+print(x=Box.test(PETR4ret, lag=12, fitdf=1, type="Ljung-Box"))
+print(x=Box.test(VALE3ret, lag=12, fitdf=1, type="Ljung-Box"))
+```
+
+## Squared log return series
+
+The calculation of the squared log return series of the assets prices shows some interesting facts. 
+Firstly, by squaring the log returns, the points in time that faced more volatility becomes more evident. For instance, it becomes even more clear the moment when the financial market crashed in March 2020 due to the announcement of the COVID pandemics. Another moment of high volatility that became more evident with the squared log return series is the peak that happen in "PETR4.SA" series in the first quarter of 2021. A quick research about this phenomena shows that "PETR4.SA" stock prices dropped nearly 21%, after president Jair Bolsonaro appointed General Joaquim Silva e Luna to replace the company's current president, Roberto Castello Branco. For Magazine Luiza, on other hand, a high volatility peak in the mid of the last quarter of 2021 was the result of the company's earnings release relative to the third quarter of the same year which indicated a decrease of nearly 90% of the gross revenue compared to the same period in the year before.
+Secondly, by plotting the **ACF** and **PACF** functions of the squared log returns it is possible to see some auto-correlation for some lags. That points out an important fact that is common to financial data which is the presence of **conditional heteroscedasticity** - periods when low and high fluctuations alternates.
+
+
+```{r calculating_return_squared, out.width="100%"}
+df_log_returns_cln_tsibble <- df_log_returns_cln_tsibble %>%
+  dplyr::mutate(ret2 = ret_closing_prices^2) 
+
+df_log_returns_cln_tsibble %>%
+  autoplot(ret2, colour = "black") +
+  facet_wrap(~ticker, ncol = 1, scales = "fixed") +
+  ggtitle("Squared log return of closing prices of selected assets", 
+          "Data ranging from Nov-2019 to Nov-22") +
+  labs(x="Reference Date", y = "Squared log return")
+```
+
+
+```{r plotting_acf_log_return_sqrd, out.width="100%"}
+df_log_returns_cln_tsibble %>%
+  ACF(ret2) %>% 
+  autoplot +
+  ggtitle("ACF plot of squared log return of closing prices of selected assets") +
+  labs(x="Lag", y = "ACF")
+```
+
+```{r plotting_pacf_log_return_sqrd, out.width="100%"}
+df_log_returns_cln_tsibble %>% 
+  PACF(ret2) %>% 
+  autoplot() +
+  ggtitle("PACF plot of squared log return of closing prices of selected assets") +
+  labs(x="Lag", y = "PACF")
+```
+
+Testing the squared log return series for white noise behaviour also show that the squared log return have auto-correlation as it would be expected.
+
+```{r ljung_box_r2, out.width="100%"}
+## Pulling log return data for each log return series
+B3SA3sqr <- df_log_returns %>% filter(ticker == 'B3SA3.SA') %>% mutate(ret2 = ret_closing_prices^2) %>% select(ret2) %>% pull()
+ENEV3sqr <- df_log_returns %>% filter(ticker == 'ENEV3.SA') %>% mutate(ret2 = ret_closing_prices^2) %>% select(ret2) %>% pull()
+HGRE11sqr <- df_log_returns %>% filter(ticker == 'HGRE11.SA') %>% mutate(ret2 = ret_closing_prices^2) %>% select(ret2) %>% pull()
+MGLU3sqr <- df_log_returns %>% filter(ticker == 'MGLU3.SA') %>% mutate(ret2 = ret_closing_prices^2) %>% select(ret2) %>% pull()
+PETR4sqr <- df_log_returns %>% filter(ticker == 'PETR4.SA') %>% mutate(ret2 = ret_closing_prices^2) %>% select(ret2) %>% pull()
+VALE3sqr <- df_log_returns %>% filter(ticker == 'VALE3.SA') %>% mutate(ret2 = ret_closing_prices^2) %>% select(ret2) %>% pull()
+
+## Printing test results
+print(x=Box.test(B3SA3sqr, lag=12, fitdf=1, type="Ljung-Box"))
+print(x=Box.test(ENEV3sqr, lag=12, fitdf=1, type="Ljung-Box"))
+print(x=Box.test(HGRE11sqr, lag=12, fitdf=1, type="Ljung-Box"))
+print(x=Box.test(MGLU3sqr, lag=12, fitdf=1, type="Ljung-Box"))
+print(x=Box.test(PETR4sqr, lag=12, fitdf=1, type="Ljung-Box"))
+print(x=Box.test(VALE3sqr, lag=12, fitdf=1, type="Ljung-Box"))
+```
+
+
+## Volatility models
+
+After confirming that the return series are not autocorrelated and that the squared returns, in turn, have autocorrelation, the volatility of each return series will be modeled using GARCH models. In the code below, different models will be tested considering combination of **model** type (hold constant as fGARCH), **submodel** (varying between TGARCH, GARCH), values of **m** and **n** (varying between 0, 1 and 2), values of **p** and **q**(varying between 0, 1, 2 and 3) and **distribution** type (hold constant as t-student). The best models will then be selected considering the ones with the lowest **Akaike Criteria**.
+
+```{r run_garch_models}
+## Creating a grid search
+mtr <- crossing(m=c(0:2), n=c(0:2), p=c(0:3), q=c(0:3), dist=c("std"))
+GridSearch <- bind_rows(cbind(tibble(model="fGARCH", submodel="TGARCH"), mtr),
+                        cbind(tibble(model="fGARCH", submodel="GARCH"), mtr)) %>%
+  tibble::rownames_to_column("id")
+
+## Running-hyper parameter tuning
+best_models <- tickers %>% 
+  purrr::set_names() %>% 
+  purrr::map(find_best_garch, grid=GridSearch) %>% 
+  dplyr::bind_rows(.id = "ticker")
+
+## Plotting the best model per asset
+final_models <- best_models %>%
+    filter(criteria == 'Akaike') %>%
+    group_by(ticker) %>%
+    slice(which.min(V1)) %>%
+    merge(., GridSearch, by.x="id", by.y="id", all.x=F, all.y=F) %>%
+    select(ticker, model, submodel, m, n, p, q, dist, criteria, V1) %>%
+    rename(criteria_value=V1)
+
+final_models
+```
+
+
+## Models backtest
+
+The rugarch package also allows backtesting by either applying a sliding window (fixed length) or an expanding window (variable length). The test is useful for comparing the performance of two (or more) models against each other in order to decide which model is the best. For time sake, the best model for each asset was chosen by comparing the **Akaike Criteria** (see calculation above), but it could also be chosen through backtesting. Nevertheless, the following code will perform a "backtest" on the best model for each asset in order to calculate its mean volatility error.  
+
+```{r}
+## Creating table df_backtest
+df_backtest <- tibble(ticker=as.character(), mean_error=as.numeric())
+
+for (asset in tickers){
+  
+  ## Updating df_backtest table
+  df_backtest <- df_backtest %>%
+    bind_rows(.,tibble(ticker=asset, mean_error=volatility_backtest(parms=final_models[final_models$ticker==asset,])))
+}
+
+df_backtest
+```
+
+## Comparing volatilities
+
+The following calculations show the "Value at Risk" (the maximum amount expected to be lost over a given time horizon) at 95% of confidence level. The formula used for the calculation is defined as:
+
+
+\begin{align*}
+VaR_{95} = 1.65 * h_{t}(1) * M
+\end{align*}
+
+
+Where $h_{t}(1)$ is the estimated volatility one step ahead and $M$ is the total amount invested, which, in this case, will be R$ 1 million for each asset. As the only variable in the equation above is the volatility term, the greatest the **VaR** value the greates the volatility. Therefore, it possible to compare the volatility of the different assets studies in this document by comparing the respective **VaR** one step ahead.
+
+Looking at the VaRs, it is possible to notice that **HGRE11.SA** has the lowest values, whereas **PETR4.SA** has the highest value (little over four times higher than the lowest value). The reason for this outcome is probably due to two main reasons:
+
+ - Firstly, the fact that **HGRE11.SA** is a real estate fund gives it a lower volatility since the value of the asset is more easily estimated. That is, knowing the vacancy rate and the rent value of each property that is in the fund portfolio gives it a good estimate of the asset value. Also, as the fund usually diversifies its investment in more than one property, vacancy increase in one property would be amortized by the payment of rents of the other properties in the portfolio. Therefore, the speculation around the asset true value would vary much less if compared to the value of a company;\
+ 
+ - Secondly, looking at the squared log return plot one may notice that **PETR4.SA** has some periods in time when the volatility of its return is greater when compared to other stocks. Therefore, even though the price return of stocks like **MGLU3.SA** seems to be constantly varying significantly, the magnitude of the volatility of **PETR4.SA** is greater during periods of high volatility (e. g. during the stock market crash and after the change of the CEO). 
+
+```{r value_at_risk}
+## Creating table to hold results
+tb_forecast_var <- tibble(ticker=as.character(),
+                          mu=as.numeric(),
+                          omega=as.numeric(),
+                          beta1=as.numeric(),
+                          shape=as.numeric(),
+                          var95=as.numeric())
+
+for (asset in tickers){
+  
+  print(asset)
+  
+  ## Predicinting the volatility one step ahead
+  predictions <- volatility_forecast(parms=final_models[final_models$ticker==asset,], n_steps=1)
+  
+  ## Calculating VaR95% considering an investment of R$ 1 million 
+  var <- round(predictions$volatility*1.65*1000000, 2)
+  
+  ## Updating table of results
+  tb_forecast_var <- tb_forecast_var %>%
+    bind_rows(., tibble(ticker=asset,
+                        mu=as_tibble(predictions$mat_coef)[1,1]$` Estimate`,
+                        omega=as_tibble(predictions$mat_coef)[2,1]$` Estimate`,
+                        beta1=as_tibble(predictions$mat_coef)[3,1]$` Estimate`,
+                        shape=as_tibble(predictions$mat_coef)[4,1]$` Estimate`,
+                        fut_vol=predictions$volatility,
+                        var95=var))
+}
+
+## Printing Results
+tb_forecast_var
+```
+
+
+## Portifolio Optimization
+
+As seen so far (also highlighted in the last table), each return series could be described, in general, by a return rate and volatility. Those parameters could, than, be used to compare the relationship between risk (volatility) and return for each asset. The knowledge of these parameters can be used to decide to invest in one asset over another in order to achieve some desired performance (e.g. maximum return / risk ratio or low risk). An even more interesting approach would be to determine the amounts (percentages) of each asset that, combined, would result the optimal value of the desired metric. The combination of these amounts of each asset will constitute what is called an investment portfolio.
+In this section, the objective will be to determine the percentages of each asset studied that would result the the optimal value of the following metrics:
+
+  - Sharpe ratio (return / risk ratio);
+  - Minimum risk.
+
+In order to determine the best portfolio, the following code will run 50000 simulations (50000 different portfolios) and select those that match the above metrics by ordering by the desired metric first followed by the maximum return in order to handle possible ties for the desired metric. Details about the functions can be found in the beginning of this document.   
+
+```{r plotting_portfolios, out.width="100%"}
+## Converting the original stock return dataset from format long to format wide
+df_log_returns_wider <- df_log_returns %>% 
+  dplyr::select(ref_date, name=ticker, value=ret_closing_prices) %>% 
+  tidyr::pivot_wider()
+
+## Creating a timetk object
+df_log_returns_xts <- df_log_returns_wider %>% 
+  timetk::tk_xts(select=-ref_date, date_var=ref_date)
+
+## Running simulations
+df_port_sim <- portfolio_simulation(nruns=50000, assets=tickers, return_xts=df_log_returns_xts)
+
+## Plotting the weights of each portfolio
+plot_min_volatility <- df_port_sim %>%
+  arrange(portfolio_volatility, desc(portfolio_return)) %>%
+  head(1) %>%
+  pivot_longer(2:7) %>% 
+  mutate(name = forcats::fct_reorder(name, value)) %>% 
+  ggplot(aes(name, value)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "Asset",
+    y = "Weight",
+    title = "Min variance portfolio weights"
+  ) +
+  theme_classic() +
+  theme(axis.text.y = element_text(size=9),
+        axis.text.x = element_text(size=6))
+
+plot_max_sharpe_ratio <- df_port_sim %>%
+  arrange(desc(portfolio_sharpe_ratio), desc(portfolio_return)) %>%
+  head(1) %>%
+  pivot_longer(2:7) %>% 
+  mutate(name = forcats::fct_reorder(name, value)) %>% 
+  ggplot(aes(name, value)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "Asset",
+    y = "Weight",
+    title = "Max sharpe ratio portfolio weights"
+  ) +
+  theme_classic() +
+  theme(axis.text.y = element_text(size=9),
+        axis.text.x = element_text(size=6))
+
+## Comparision
+plot <- ggarrange(plot_min_volatility, 
+                  plot_max_sharpe_ratio, 
+                  ncol=2, 
+                  nrow=1, 
+                  widths=c(1,1),
+                  legend="bottom",
+                  common.legend = T)
+
+annotate_figure(plot, top=text_grob("Portfolio optimization considering minimum volatility and maximum sharpe ratio", 
+                                    color="#000000", 
+                                    size=14, 
+                                    x=unit(0.5, "lines"), 
+                                    y=unit(0, "lines"), 
+                                    just="left", 
+                                    hjust=0, 
+                                    vjust=0))
+```
+The left chart above indicates that if the desire was to obtain the **lowest risk** the best option would be to allocate most of the portfolio in **"HGRE11.SA"** and a only a small percentage in **PETR4.SA**, **B3SA3.SA** and **MGLU3.SA**. This result is in line with what was expected since, as seen in the previous section, the asset **HGRE11.SA** has the lowest volatility while **PETR4.SA** and **"MGLU3.SA"** have higher volatility. It would be only natural that the portfolio that optimizes based on lower risk would give priority to the less volatile asset to the detriment of assets with higher volatility. 
+The right chart, on the other hand, suggests that if the desired metric was now the optimum relationship between return and risk (Sharpe ratio), the best option would be to allocate the majority of the portfolio in **VALE3.SA** followed by **ENEV3.SA**, which have high return in average. The chart also suggest a small portion of **MGLU3.SA** which is probably due to the fact that the return of this asset is very low to level of risk it has.
+In summary, considering the comments made, it seems that the simulation is doing a decent job finding the optimum portfolio in each case. There may be even better result, but the ones that were found so far are already satisfactory.
+In order to see how these options chosen compare with the other portfolios simulated, the next chart shows the plot of the return against the risk for each simulation. In the figure, the red dot at the top denotes the portfolio that optimizes the Sharpe ratio while the leftmost red dot denotes the portfolio with the lowest risk. It is important to highlight that the return have been annualized by multiplying the daily return by 252.
+
+
+```{r plotting_efficiency_frontier, out.width="100%"}
+df_port_sim %>% 
+  ggplot(aes(x = portfolio_volatility, y = portfolio_return, color = portfolio_sharpe_ratio)) +
+  geom_point() +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(
+    x = 'Risk',
+    y = 'Returns',
+    title = "Portfolio Optimization & Efficient Frontier"
+  ) +
+  geom_point(
+    aes(x = portfolio_volatility, y = portfolio_return), 
+    data = df_port_sim %>% arrange(portfolio_volatility, desc(portfolio_return)) %>% head(1), 
+    color = 'red'
+  ) +
+  geom_point(
+    aes(x = portfolio_volatility, y = portfolio_return), 
+    data = df_port_sim %>% arrange(desc(portfolio_sharpe_ratio), desc(portfolio_return)) %>% head(1), 
+    color = 'red'
+  )
+```
+
+## VaR do portfolio
+
+Considering the calculation of future volatility, a concept widely used to measure market risk one (a few) steps ahead is the concept of value at risk (VaR). The VaR calculation considers future volatility, a desired confidence level and an invested amount in order to determine the maximum possible value that can be lost through an investment, be it an asset or portfolio, according to the following equation:
+
+\begin{align*}
+VaR = r(1) + \frac{t_{\nu}(p)*\sqrt{h_{t}(1)}}{\sqrt{\frac{\nu}{\nu-2}}}
+\end{align*}
+
+Where $r(1)$ is one-step forward forecasting of returns, $h_{t}(1)$ is the volatility forecast, $\nu$ is the degree of freedom estimated and $t_{\nu}(p)$ is the p-quantile of Standard Student t-distribution with degrees of freedom.
+
+The following code calculates the VaR for the portfolio with the optimum Sharpe ratio. It can be seen that the value is ... 
+
+```{r var_portfolio_low_risk}
+## Fetching the best set of weights considering the best sharpe ratio
+best_weights_volatility <- df_port_sim %>% 
+  arrange(portfolio_volatility, desc(portfolio_return)) %>% 
+  head(1) %>%
+  pivot_longer(2:7) %>%
+  dplyr::select(name, value) %>%
+  dplyr::rename(ticker=name, weights=value) %>%
+  base::merge(., tb_forecast_var %>% select(ticker, fut_vol, shape), by.x="ticker", by.y="ticker", all.x=F, all.y=F) %>%
+  tibble::as_tibble() %>%
+  dplyr::mutate(weighted_volatility = weights*fut_vol,
+                weighted_shape =  weights*shape)
+
+
+## Calculating the covariance matrix
+cov_mat <- cov(df_log_returns_xts)
+
+## Calculating 
+volatility_final <- as.numeric(sqrt(best_weights_volatility$weights %*% cov_mat %*% best_weights_volatility$weights))
+
+## Calculating the degrees of freedom
+nu <- 100
+
+## Calculating the t-value from a t-student distribution
+tvalue <- qt(.95, nu)
+
+
+## Calculating the Value at risk (VaR) considering an investment of R$ 1 million
+VaRv <- (sum(best_weights_volatility$weighted_volatility) + tvalue * volatility_final / sqrt(nu/(nu-2)))
+VaR <- VaRv*10^6
+
+print(paste("The value at risk for the optimum Sharpe Ratio portfolio with 95% confidence (VaR95) is: R$ ", 
+            round(VaR,0), 
+            " reais for an investment of R$ 1 million (", 
+            round(100*VaRv,1),
+            "%)", sep=""))
+```
+
+```{r var_portfolio_sharpe}
+## Fetching the best set of weights considering the best sharpe ratio
+best_weights_sharpe <- df_port_sim %>% 
+  arrange(desc(portfolio_sharpe_ratio), desc(portfolio_return)) %>% 
+  head(1) %>%
+  pivot_longer(2:7) %>%
+  dplyr::select(name, value) %>%
+  dplyr::rename(ticker=name, weights=value) %>%
+  base::merge(., tb_forecast_var %>% select(ticker, fut_vol, shape), by.x="ticker", by.y="ticker", all.x=F, all.y=F) %>%
+  tibble::as_tibble() %>%
+  dplyr::mutate(weighted_volatility = weights*fut_vol,
+                weighted_shape =  weights*shape)
+
+
+## Calculating the covariance matrix
+cov_mat <- cov(df_log_returns_xts)
+
+## Calculating 
+volatility_final <- as.numeric(sqrt(best_weights_sharpe$weights %*% cov_mat %*% best_weights_sharpe$weights))
+
+## Calculating the degrees of freedom
+nu <- 100
+
+## Calculating the t-value from a t-student distribution
+tvalue <- qt(.95, nu)
+
+
+## Calculating the Value at risk (VaR) considering an investiment of R$ 1 million
+VaRv <- (sum(best_weights_sharpe$weighted_volatility) + tvalue * volatility_final / sqrt(nu/(nu-2)))
+VaR <- VaRv*10^6
+
+print(paste("The value at risk for the optimum Sharpe Ratio portfolio with 95% confidence (VaR95) is: R$ ", 
+            round(VaR,0), 
+            " reais for an investment of R$ 1 million (", 
+            round(100*VaRv,1),
+            "%)", sep=""))
+```
+
+## CAPM
+
+In the following section it will be used the **capital asset pricing model (CAPM)** as an alternative for pricing individuals assets  considering that the expected return of an asset varies more or less than a given reference, which, in the context of this work will be considered to be the **IBOVESPA** return. The reason for choosing the **IBOVESPA** index as the benchmark is due to the fact that it is the most used index by the financial market to evaluate the performance of equity investments in Brazil. Therefore, it will be calculated the beta values of each asset studied in this document and also the beta values of the optimum portfolios defined in the previous section considering the hypothesis assumed by the CAPM model.
+The CAPM formula can be written as follow:
+
+\begin{align*}
+E(R_{i}) = E(R_{f}) + \beta_{i}(E(R_{m}) - E(R_{f}))
+\end{align*}
+
+Where $E(R_{i})$ is the expected return of the ith-asset, $E(R_{f})$ is the risk free return and $E(R_{m})$ is the market return (which in the context of this work will be the **IBOVESPA** return.
+The beta value, in turn, indicates the relationship between systematic risk and expected return and will be estimated through a linear regression using the method of least squares, for each asset, and assuming that $E(R_{f}) = 0$.
+
+
+```{r}
+## Reading the log-return of BVSP closing price from a csv file
+df_bvsp <- read_csv("20221122_bvsp.csv", show_col_types = F) %>%
+    dplyr::mutate(ret_closing_prices = as.numeric(ret_closing_prices)) %>%
+    dplyr::filter(ref_date >= min(df_log_returns$ref_date) & ref_date <= end_date) %>%
+    dplyr::select(ref_date, ibov = ret_closing_prices)
+
+
+## Initializing result table
+all_betas <- tibble(ticker=as.character(), beta=as.numeric())
+
+## Calculating betas
+for (asset in tickers){
+  
+  all_betas <- all_betas %>%
+    bind_rows(., tibble(ticker=asset, beta=calculate_beta(asset=asset)))
+}
+
+## Merging with best portfolio information
+all_betas <- all_betas %>%
+  base::merge(., best_weights_volatility %>% select(ticker, weights), by.x="ticker", by.y="ticker", all.x=F, all.y=F) %>%
+  dplyr::rename(w_opt_vol = weights) %>%
+  dplyr::mutate(w_beta_opt_vol = beta*w_opt_vol) %>%
+  base::merge(., best_weights_sharpe %>% select(ticker, weights), by.x="ticker", by.y="ticker", all.x=F, all.y=F) %>%
+  dplyr::rename(w_opt_sr = weights) %>%
+  dplyr::mutate(w_beta_opt_sr = beta*w_opt_sr)
+
+## Printing individual betas  
+all_betas
+```
+
+Looking at the beta values calculated for each asset in the table above, it can be seen that **MGLU3.SA** and **PETR4.SA** have the higher beta values among all the assets with values higher than 1, which is the beta value addressed to the benchmark (**IBOVESPA**).
+That indicates that these two stocks returns are much more volatile than the market's, which means higher risk. Additionally, the beta value of **B3SA3.SA** is marginally above 1, suggesting a return volatility slightly higher than the return of the market, however much less volatile if compared to **MGLU3.SA** and **PETR4.SA**. On the other hand, **HGRE11.SA** has the lowest beta value, which suggests the lowest volatility. That is also aligned with all that has been pointed out so far about the volatility of this asset. The stocks **VALE3.SA** and **ENEV3.SA** also have beta values lower than 1, despite being much higher than the value of **HGRE11.SA**. Even so, these assets have less volatility if compared to the market.
+Finally, the return of both portfolios (minimum volatility and optimum Sharpe ratio) exhibit lower volatility than the market since the estimated beta value is less than 1 for both assets. 
+As expected, the beta value of the portfolio with minimum volatility is lower than the beta value of the portfolio with optimum Sharpe ratio. However, what is interesting to notice is that the portfolio with the optimum Sharpe ratio has a higher average return than the market (annualized average return of **IBOVESPA**: 2,4% and annualized average return of optimum Sharpe ratio portfolio: 13,1%) while its volatility is lower than the market. That confirms that the portfolio in question is, in fact, outperforms the market.
+ 
+
+```{r}
+## Calculating the beta value for the portfolio
+beta_opt_vol <- sum(all_betas$w_beta_opt_vol)
+
+print(paste("The beta value of the portfolio that minimizes the volatility is:", round(beta_opt_vol,3)))
+```
+
+```{r}
+## Calculating the beta value for the portfolio
+beta_opt_sr <- sum(all_betas$w_beta_opt_sr)
+
+print(paste("The beta value of the portfolio that optimizes the sharpe ratio is:", round(beta_opt_sr,3)))
+```
+
+[1] D.D., Portfolio Optimization in R, https://www.codingfinance.com/post/2018-05-31-portfolio-opt-in-r/. Accessed on 2022-11-20.
+
+[2] Hyndman, R.J., & Athanasopoulos, G. (2021) Forecasting: principles and practice, 3rd edition, OTexts: Melbourne, Australia. OTexts.com/fpp3. Accessed on 2022-11-15.
+
